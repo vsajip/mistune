@@ -1,6 +1,7 @@
 *.pyc
 *.pyo
 *.egg-info
+.idea
 __pycache__
 bin
 build
@@ -16,4 +17,11 @@ cover/
 *.bak
 *.c
 *.so
-venv/
+.venv/
+.python-version
+.coverage
+htmlcov
+.eggs
+coverage.xml
+demo.py
+uv.lock

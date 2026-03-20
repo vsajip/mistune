@@ -1,24 +1,12 @@
-.PHONY: clean-pyc clean-build docs
+.PHONY: clean-pyc clean-build build-docs
 
-test:
-	@nosetests -s
-
-bench:
-	@python tests/bench.py
-
-coverage:
-	@rm -f .coverage
-	@nosetests --with-coverage --cover-package=mistune --cover-html
-
-clean: clean-build clean-pyc clean-docs
-
+clean: clean-build clean-pyc
 
 clean-build:
 	@rm -fr build/
 	@rm -fr dist/
 	@rm -fr *.egg-info
-	@rm -f mistune.c
-	@rm -fr cover/
+	@rm -fr .coverage
 
 
 clean-pyc:
@@ -27,17 +15,6 @@ clean-pyc:
 	@find . -name '*~' -exec rm -f {} +
 	@find . -name '__pycache__' -exec rm -fr {} +
 
-clean-docs:
-	@rm -fr  docs/_build
 
-docs:
-	@$(MAKE) -C docs html
-
-rtd:
-	curl -X POST http://readthedocs.org/build/mistune
-
-publish:
-	@twine upload dist/*.tar.gz
-	@twine upload dist/*.whl
-
-.PHONY: build
+build-docs:
+	@sphinx-build docs build/_html -a

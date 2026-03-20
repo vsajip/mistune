@@ -1,5 +1,6 @@
-include Makefile LICENSE README.rst CHANGES.rst
-exclude mistune.c
-recursive-include tests *
-recursive-exclude tests *.pyc
-recursive-exclude tests *.pyo
+# include all test files but avoid including .pyc
+recursive-include benchmark *.py *.txt
+recursive-include tests *.json *.html *.md *.py *.txt
+# include documentation sources but not built docs
+graft docs
+prune docs/_build
