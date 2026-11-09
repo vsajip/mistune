@@ -9,23 +9,24 @@ Mistune has several built-in renderers, including:
 - :class:`mistune.renderers.markdown.MarkdownRenderer`
 - :class:`mistune.renderers.rst.RSTRenderer`
 
-You're welcome to contribute more renderers.
+You can add more renderers.
 
 Customize HTMLRenderer
 ----------------------
 
-You can customize HTML output with your own renderers. Take an example, we're going
-to add an inline math syntax like below:
+Create a renderer subclass to customize HTML output. This example adds
+inline math syntax:
 
 .. code::
 
     `$a^2=4$`
 
-To render this syntax, we can create a subclass of ``mistune.HTMLRenderer``:
+To render this syntax, create a subclass of ``mistune.HTMLRenderer``:
 
 .. code-block:: python
 
-    from mistune import HTMLRenderer
+    import mistune
+    from mistune import HTMLRenderer, escape
 
     class MyRenderer(HTMLRenderer):
         def codespan(self, text):
@@ -33,14 +34,70 @@ To render this syntax, we can create a subclass of ``mistune.HTMLRenderer``:
                 return '<span class="math">' + escape(text) + '</span>'
             return '<code>' + escape(text) + '</code>'
 
-    # use customized renderer
+    # use the custom renderer
     markdown = mistune.create_markdown(renderer=MyRenderer())
     print(markdown('hi `$a^2=4$`'))
+
+Customize plugin output
+~~~~~~~~~~~~~~~~~~~~~~~
+
+You can also override methods supplied by plugins. Enable the plugin to
+parse its syntax, then define the matching method on your ``HTMLRenderer``
+subclass. For example, add a CSS class to tables:
+
+.. code-block:: python
+
+    import mistune
+
+    class TableRenderer(mistune.HTMLRenderer):
+        def table(self, text):
+            return '<table class="data-table">\n' + text + '</table>\n'
+
+    markdown = mistune.create_markdown(
+        renderer=TableRenderer(), plugins=['table'],
+    )
+    print(markdown('| Name | Count |\n| --- | ---: |\n| Apples | 3 |'))
+
+The subclass method takes precedence over the plugin's registered renderer.
+The other table methods keep their default behavior, including header cells
+and column alignment. ``text`` already contains the rendered child HTML;
+do not escape it again.
+
+Plugin methods are registered on the renderer instance, not defined on
+``HTMLRenderer`` itself, so ``super().table(text)`` is not available. To
+reuse the default table output inside an override, import ``render_table``
+from ``mistune.plugins.table`` and call ``render_table(self, text)``.
+
+HTML safety methods
+~~~~~~~~~~~~~~~~~~~
+
+``HTMLRenderer`` exposes output-context helpers for custom renderers and
+plugins:
+
+* ``escape_enabled`` reports and controls whether raw HTML tokens are escaped.
+* ``escape_raw(value)`` conditionally escapes a raw HTML token.
+* ``escape_attribute(value)`` always escapes an HTML attribute value.
+* ``render_attrs(attrs)`` renders fixed attribute names, omits ``None`` and
+  ``False`` values, and escapes every non-boolean value. Invalid attribute
+  names raise ``ValueError``.
+* ``sanitize_url(url)`` applies the renderer's URL protocol policy and returns
+  either the original URL or ``#harmful-link``.
+
+Keep URL filtering separate from attribute escaping. For example::
+
+    class LinkRenderer(HTMLRenderer):
+        def link(self, text, url, title=None):
+            attrs = {'href': self.sanitize_url(url), 'title': title}
+            return '<a' + self.render_attrs(attrs) + '>' + text + '</a>'
+
+``safe_url(url)`` remains available for compatibility and returns an
+attribute-escaped result.
 
 Available methods
 ~~~~~~~~~~~~~~~~~
 
-Here is a a list of available renderer functions for ``HTMLRenderer``, including methods on plugins:
+This list shows the renderer methods for ``HTMLRenderer``. It also includes
+methods from plugins:
 
 .. code-block::
 
@@ -89,7 +146,7 @@ Here is a a list of available renderer functions for ``HTMLRenderer``, including
     # provided by task_lists plugin
     task_list_item(self, text, checked=False, **attrs)
 
-    # provide by table plugin
+    # provided by table plugin
     table(self, text)
     table_head(self, text)
     table_body(self, text)
@@ -101,20 +158,20 @@ Here is a a list of available renderer functions for ``HTMLRenderer``, including
     footnotes(self, text)
     footnote_item(self, text, key, index)
 
-    # provide by def_list plugin
+    # provided by def_list plugin
     def_list(self, text)
     def_list_head(self, text)
     def_list_item(self, text)
 
-    # provide by math plugin
+    # provided by math plugin
     block_math(self, text)
     inline_math(self, text)
 
 
-RestructuredText Renderer
+reStructuredText Renderer
 -------------------------
 
-The ``RSTRenderer`` can be used to convert markdown text to RestructuredText.
+Use ``RSTRenderer`` to convert Markdown text to reStructuredText.
 
 .. code-block:: python
 
@@ -127,7 +184,7 @@ The ``RSTRenderer`` can be used to convert markdown text to RestructuredText.
 Markdown Renderer
 -----------------
 
-The ``MarkdownRenderer`` can be used to reformat your Markdown text.
+Use ``MarkdownRenderer`` to reformat Markdown text.
 
 .. code-block:: python
 
@@ -139,26 +196,29 @@ The ``MarkdownRenderer`` can be used to reformat your Markdown text.
 With plugins
 ~~~~~~~~~~~~
 
-The original ``MarkdownRenderer`` can **ONLY** render the basic Markdown syntax.
-If you're using plugins, you would need to customize ``MarkdownRenderer`` with
-extra render methods. Take an example, you are going to add the :ref:`strikethrough`
-plugin:
+The default ``MarkdownRenderer`` renders only basic Markdown syntax.
+If you use plugins, add render methods for the plugin tokens. This example
+adds the :ref:`strikethrough` plugin:
 
 .. code-block:: python
 
+    import mistune
     from mistune.renderers.markdown import MarkdownRenderer
 
     class MyRenderer(MarkdownRenderer):
         def strikethrough(self, token, state):
             return '~~' + self.render_children(token, state) + '~~'
 
-    format_markdown = mistune.create_markdown(renderer=MarkdownRenderer(), plugins=['strikethrough'])
-    format_markdown(your_markdown_text)
+    format_markdown = mistune.create_markdown(renderer=MyRenderer(), plugins=['strikethrough'])
+    print(format_markdown('~~text~~'))
+    # ~~text~~
+
+Pass the custom renderer instance so that its plugin methods are used.
 
 Default methods
 ~~~~~~~~~~~~~~~
 
-Here is a a list of default renderer functions of ``MarkdownRenderer``:
+This list shows the default renderer methods for ``MarkdownRenderer``:
 
 .. code-block::
 

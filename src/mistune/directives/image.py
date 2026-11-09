@@ -1,7 +1,6 @@
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Match, Optional
 
-from ..util import escape as escape_text
 from ..util import escape_url
 from ._base import BaseDirective, DirectivePlugin
 
@@ -13,7 +12,7 @@ if TYPE_CHECKING:
 
 __all__ = ["Image", "Figure"]
 
-_num_re = re.compile(r"^\d+(?:\.\d*)?")
+_num_re = re.compile(r"^\d+(?:\.\d+)?(?:px|ch|em|rem|ex|rex|vw|vh|%)?$")
 _allowed_aligns = ["top", "middle", "bottom", "left", "center", "right"]
 
 
@@ -29,9 +28,9 @@ def _parse_attrs(options: Dict[str, Any]) -> Dict[str, Any]:
 
     height = options.get("height")
     width = options.get("width")
-    if height and _num_re.match(height):
+    if height and _num_re.fullmatch(height):
         attrs["height"] = height
-    if width and _num_re.match(width):
+    if width and _num_re.fullmatch(width):
         attrs["width"] = width
     if "target" in options:
         attrs["target"] = escape_url(options["target"])
@@ -62,24 +61,24 @@ def render_block_image(
     height: Optional[str] = None,
     **attrs: Any,
 ) -> str:
-    img = '<img src="' + escape_text(src) + '"'
+    image_attrs: Dict[str, object] = {"src": self.sanitize_url(src)}
     style = ""
     if alt:
-        img += ' alt="' + escape_text(alt) + '"'
-    if width:
+        image_attrs["alt"] = alt
+    if width and _num_re.fullmatch(width):
         if width.isdigit():
-            img += ' width="' + width + '"'
+            image_attrs["width"] = width
         else:
             style += "width:" + width + ";"
-    if height:
+    if height and _num_re.fullmatch(height):
         if height.isdigit():
-            img += ' height="' + height + '"'
+            image_attrs["height"] = height
         else:
             style += "height:" + height + ";"
     if style:
-        img += ' style="' + escape_text(style) + '"'
+        image_attrs["style"] = style
 
-    img += " />"
+    img = "<img" + self.render_attrs(image_attrs) + " />"
 
     _cls = "block-image"
     align = attrs.get("align")
@@ -88,11 +87,10 @@ def render_block_image(
 
     target = attrs.get("target")
     if target:
-        href = self.safe_url(target)
-        outer = '<a class="' + _cls + '" href="' + href + '">'
+        outer = "<a" + self.render_attrs({"class": _cls, "href": self.sanitize_url(target)}) + ">"
         return outer + img + "</a>\n"
     else:
-        return '<div class="' + _cls + '">' + img + "</div>\n"
+        return "<div" + self.render_attrs({"class": _cls}) + ">" + img + "</div>\n"
 
 
 class Figure(DirectivePlugin):
@@ -124,9 +122,11 @@ class Figure(DirectivePlugin):
         fig_attrs = {}
         if align:
             fig_attrs["align"] = align
-        for k in ["figwidth", "figclass"]:
-            if k in options:
-                fig_attrs[k] = options[k]
+        figwidth = options.get("figwidth")
+        if figwidth and _num_re.fullmatch(figwidth):
+            fig_attrs["figwidth"] = figwidth
+        if "figclass" in options:
+            fig_attrs["figclass"] = options["figclass"]
 
         children = [{"type": "block_image", "attrs": image_attrs}]
         content = self.parse_directive_content(block, m, state)
@@ -150,7 +150,7 @@ class Figure(DirectivePlugin):
 
 
 def render_figure(
-    self: Any,
+    self: "HTMLRenderer",
     text: str,
     align: Optional[str] = None,
     figwidth: Optional[str] = None,
@@ -160,12 +160,12 @@ def render_figure(
     if align:
         _cls += " align-" + align
     if figclass:
-        _cls += " " + escape_text(figclass)
+        _cls += " " + figclass
 
-    html = '<figure class="' + _cls + '"'
-    if figwidth:
-        html += ' style="width:' + escape_text(figwidth) + '"'
-    return html + ">\n" + text + "</figure>\n"
+    figure_attrs: Dict[str, object] = {"class": _cls}
+    if figwidth and _num_re.fullmatch(figwidth):
+        figure_attrs["style"] = "width:" + figwidth
+    return "<figure" + self.render_attrs(figure_attrs) + ">\n" + text + "</figure>\n"
 
 
 def render_figcaption(self: Any, text: str) -> str:

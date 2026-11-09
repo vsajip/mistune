@@ -3,7 +3,7 @@ from typing import Any, Dict, Iterable, List, cast
 
 from ..core import BaseRenderer, BlockState
 from ..util import strip_end
-from ._list import render_list
+from ._list import render_list, render_list_item
 
 
 class RSTRenderer(BaseRenderer):
@@ -113,7 +113,11 @@ class RSTRenderer(BaseRenderer):
         return "--------------\n\n"
 
     def block_text(self, token: Dict[str, Any], state: BlockState) -> str:
-        return self.render_children(token, state) + "\n"
+        text = self.render_children(token, state)
+        lines = text.split("<linebreak>")
+        if len(lines) > 1:
+            text = "\n".join("| " + line for line in lines)
+        return text + "\n"
 
     def block_code(self, token: Dict[str, Any], state: BlockState) -> str:
         attrs = token.get("attrs", {})
@@ -127,9 +131,10 @@ class RSTRenderer(BaseRenderer):
 
     def block_quote(self, token: Dict[str, Any], state: BlockState) -> str:
         text = indent(self.render_children(token, state), "   ")
-        prev = token["prev"]
+        prev = token.get("prev")
         ignore_blocks = (
             "paragraph",
+            "block_text",
             "thematic_break",
             "linebreak",
             "heading",
@@ -147,3 +152,11 @@ class RSTRenderer(BaseRenderer):
 
     def list(self, token: Dict[str, Any], state: BlockState) -> str:
         return render_list(self, token, state)
+
+    def list_item(self, token: Dict[str, Any], state: BlockState) -> str:
+        return render_list_item(self, token, state)
+
+    def task_list_item(self, token: Dict[str, Any], state: BlockState) -> str:
+        checked = token.get("attrs", {}).get("checked")
+        marker = "[x] " if checked else "[ ] "
+        return render_list_item(self, token, state, marker)

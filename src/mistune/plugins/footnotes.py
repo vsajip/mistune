@@ -34,10 +34,15 @@ def parse_inline_footnote(inline: "InlineParser", m: Match[str], state: "InlineS
         notes = state.env.get("footnotes")
         if not notes:
             notes = []
-        if key not in notes:
+        indexes = state.env.get("footnote_indexes")
+        if not indexes:
+            indexes = {note_key: index for index, note_key in enumerate(notes)}
+            state.env["footnote_indexes"] = indexes
+        if key not in indexes:
             notes.append(key)
+            indexes[key] = len(notes) - 1
             state.env["footnotes"] = notes
-        state.append_token({"type": "footnote_ref", "raw": key, "attrs": {"index": notes.index(key) + 1}})
+        state.append_token({"type": "footnote_ref", "raw": key, "attrs": {"index": indexes[key] + 1}})
     else:
         state.append_token({"type": "text", "raw": m.group(0)})
     return m.end()
@@ -72,8 +77,7 @@ def parse_footnote_item(block: "BlockParser", key: str, index: int, state: Block
         pattern = re.compile(r"^ {" + str(spaces) + r",}", flags=re.M)
         text = pattern.sub("", text).strip()
 
-        footer_state = BlockState()
-        footer_state.process(text)
+        footer_state = state.child_state(text + "\n")
         block.parse(footer_state)
         children = footer_state.tokens
     else:

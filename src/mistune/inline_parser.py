@@ -1,27 +1,42 @@
+from __future__ import annotations
+
 import re
-from typing import (
-    Any,
-    Dict,
-    List,
-    Match,
-    MutableMapping,
-    Optional,
-)
+from typing import Any, Dict, Iterable, List, Match, MutableMapping, Optional, Set, Tuple, Union
 
-from .core import InlineState, Parser
-from .helpers import (
-    HTML_ATTRIBUTES,
-    HTML_TAGNAME,
-    PREVENT_BACKSLASH,
-    PUNCTUATION,
-    parse_link,
-    parse_link_label,
-    parse_link_text,
-    unescape_char,
-)
-from .util import escape_url, unikey
+from ._inline.emphasis import finalize_emphasis_tokens
+from ._inline.links import parse_link_close, parse_link_open
+from .core import DEFAULT_MAX_NESTED_LEVEL, InlineState, Parser
+from .helpers import HTML_ATTRIBUTES, HTML_TAGNAME, PUNCTUATION, unescape_char
+from .util import escape_url
 
-PAREN_END_RE = re.compile(r"\s*\)")
+DEFAULT_MAX_EMPHASIS_DEPTH = DEFAULT_MAX_NESTED_LEVEL
+DEFAULT_MAX_IMAGE_DEPTH = DEFAULT_MAX_NESTED_LEVEL
+
+_KNOWN_RULE_START_CHARS = {
+    "escape": {"\\"},
+    "codespan": {"`"},
+    "emphasis": {"*", "_"},
+    "link": {"!", "["},
+    "link_close": {"]"},
+    "auto_link": {"<"},
+    "auto_email": {"<"},
+    "inline_html": {"<"},
+    "linebreak": {"\n"},
+    "softbreak": {"\n"},
+    "prec_auto_link": {"<"},
+    "prec_inline_html": {"<"},
+    # built-in plugins
+    "url_link": {"h"},
+    "strikethrough": {"~"},
+    "mark": {"="},
+    "insert": {"^"},
+    "superscript": {"^"},
+    "subscript": {"~"},
+    "footnote": {"["},
+    "inline_math": {"$"},
+    "ruby": {"["},
+    "inline_spoiler": {">"},
+}
 
 AUTO_EMAIL = (
     r"""<[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9]"""
@@ -29,23 +44,8 @@ AUTO_EMAIL = (
     r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*>"
 )
 
-INLINE_HTML = (
-    r"<" + HTML_TAGNAME + HTML_ATTRIBUTES + r"\s*/?>|"  # open tag
-    r"</" + HTML_TAGNAME + r"\s*>|"  # close tag
-    r"<!--(?!>|->)(?:(?!--)[\s\S])+?(?<!-)-->|"  # comment
-    r"<\?[\s\S]+?\?>|"  # script like <?php?>
-    r"<![A-Z][\s\S]+?>|"  # doctype
-    r"<!\[CDATA[\s\S]+?\]\]>"  # cdata
-)
-
-EMPHASIS_END_RE = {
-    "*": re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\\*|[^\s*])\*(?!\*)"),
-    "_": re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\_|[^\s_])_(?!_)\b"),
-    "**": re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\\*|[^\s*])\*\*(?!\*)"),
-    "__": re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\_|[^\s_])__(?!_)\b"),
-    "***": re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\\*|[^\s*])\*\*\*(?!\*)"),
-    "___": re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\_|[^\s_])___(?!_)\b"),
-}
+_HTML_DECLARATION_START = re.compile(r"<![A-Z]+[ \t\n\r\f]")
+_INLINE_HTML_TAG = re.compile(r"<" + HTML_TAGNAME + HTML_ATTRIBUTES + r"\s*/?>|</" + HTML_TAGNAME + r"\s*>")
 
 
 class InlineParser(Parser[InlineState]):
@@ -65,13 +65,14 @@ class InlineParser(Parser[InlineState]):
         # `code, ```code
         "codespan": r"`{1,}",
         # *w, **w, _w, __w
-        "emphasis": r"\*{1,3}(?=[^\s*])|\b_{1,3}(?=[^\s_])",
+        "emphasis": r"[*_]+",
         # [link], ![img]
         "link": r"!?\[",
+        "link_close": r"\]+",
         # <https://example.com>. regex copied from commonmark.js
         "auto_link": r"<[A-Za-z][A-Za-z0-9.+-]{1,31}:[^<>\x00-\x20]*>",
         "auto_email": AUTO_EMAIL,
-        "inline_html": INLINE_HTML,
+        "inline_html": r"<(?:/?[A-Za-z]|!|\?)",
         "linebreak": STD_LINEBREAK,
         "softbreak": HARD_LINEBREAK,
         "prec_auto_link": r"<[A-Za-z][A-Za-z\d.+-]{1,31}:",
@@ -82,16 +83,32 @@ class InlineParser(Parser[InlineState]):
         "codespan",
         "emphasis",
         "link",
+        "link_close",
         "auto_link",
         "auto_email",
         "inline_html",
         "linebreak",
     )
 
-    def __init__(self, hard_wrap: bool = False) -> None:
+    def __init__(
+        self,
+        hard_wrap: bool = False,
+        max_emphasis_depth: Optional[int] = None,
+        max_image_depth: Optional[int] = None,
+        *,
+        max_nested_level: int = DEFAULT_MAX_NESTED_LEVEL,
+    ) -> None:
         super(InlineParser, self).__init__()
 
         self.hard_wrap = hard_wrap
+        # Older keyword names configure the same bound, rather than independent
+        # per-token budgets that can be bypassed by alternating syntax types.
+        limits = [max_nested_level] + [value for value in (max_emphasis_depth, max_image_depth) if value is not None]
+        self.max_nested_level = min(limits)
+        self._fast_trigger_chars: Optional[Set[str]] = None
+        self._fast_trigger_re: Optional[re.Pattern[str]] = None
+        self._fast_trigger_re_chars: Optional[Tuple[str, ...]] = None
+        self._rule_start_chars: Dict[str, Set[str]] = {}
         # lazy add linebreak
         if hard_wrap:
             self.specification["linebreak"] = self.HARD_LINEBREAK
@@ -100,116 +117,66 @@ class InlineParser(Parser[InlineState]):
 
         self._methods = {name: getattr(self, "parse_" + name) for name in self.rules}
 
+    @property
+    def max_nested_level(self) -> int:
+        return self._max_nested_level
+
+    @max_nested_level.setter
+    def max_nested_level(self, value: int) -> None:
+        if value < 1:
+            raise ValueError("max_nested_level must be positive")
+        self._max_nested_level = value
+
+    @property
+    def max_emphasis_depth(self) -> int:
+        return self.max_nested_level
+
+    @max_emphasis_depth.setter
+    def max_emphasis_depth(self, value: int) -> None:
+        self.max_nested_level = value
+
+    @property
+    def max_image_depth(self) -> int:
+        return self.max_nested_level
+
+    @max_image_depth.setter
+    def max_image_depth(self, value: int) -> None:
+        self.max_nested_level = value
+
+    def register(
+        self,
+        name: str,
+        pattern: Optional[str],
+        func: Any,
+        before: Optional[str] = None,
+        *,
+        start_chars: Optional[Union[str, Iterable[str]]] = None,
+    ) -> None:
+        """Register an inline rule with optional exhaustive start characters."""
+        self._rule_start_chars.pop(name, None)
+        if start_chars is not None:
+            self._rule_start_chars[name] = _normalize_start_chars(start_chars)
+        super().register(name, pattern, func, before=before)
+        self._fast_trigger_chars = None
+        self._fast_trigger_re = None
+        self._fast_trigger_re_chars = None
+
     def parse_escape(self, m: Match[str], state: InlineState) -> int:
         text = m.group(0)
         text = unescape_char(text)
-        state.append_token(
-            {
-                "type": "text",
-                "raw": text,
-            }
-        )
+        self.process_text(text, state, parse_emphasis=False)
         return m.end()
 
     def parse_link(self, m: Match[str], state: InlineState) -> Optional[int]:
-        pos = m.end()
+        return parse_link_open(self, m, state)
 
-        marker = m.group(0)
-        is_image = marker[0] == "!"
-        if is_image and state.in_image:
-            state.append_token({"type": "text", "raw": marker})
-            return pos
-        elif not is_image and state.in_link:
-            state.append_token({"type": "text", "raw": marker})
-            return pos
-
-        text = None
-        label, end_pos = parse_link_label(state.src, pos)
-        if label is None:
-            text, end_pos = parse_link_text(state.src, pos)
-            if text is None:
-                return None
-
-        assert end_pos is not None
-
-        if text is None:
-            text = label
-
-        assert text is not None
-
-        if end_pos >= len(state.src) and label is None:
-            return None
-
-        rules = ["codespan", "prec_auto_link", "prec_inline_html"]
-        prec_pos = self.precedence_scan(m, state, end_pos, rules)
-        if prec_pos:
-            return prec_pos
-
-        if end_pos < len(state.src):
-            c = state.src[end_pos]
-            if c == "(":
-                # standard link [text](<url> "title")
-                attrs, pos2 = parse_link(state.src, end_pos + 1)
-                if pos2:
-                    token = self.__parse_link_token(is_image, text, attrs, state)
-                    state.append_token(token)
-                    return pos2
-
-            elif c == "[":
-                # standard ref link [text][label]
-                label2, pos2 = parse_link_label(state.src, end_pos + 1)
-                if pos2:
-                    end_pos = pos2
-                    if label2:
-                        label = label2
-
-        if label is None:
-            return None
-
-        ref_links = state.env.get("ref_links")
-        if not ref_links:
-            return None
-
-        key = unikey(label)
-        env = ref_links.get(key)
-        if env:
-            attrs = {"url": env["url"], "title": env.get("title")}
-            token = self.__parse_link_token(is_image, text, attrs, state)
-            token["ref"] = key
-            token["label"] = label
-            state.append_token(token)
-            return end_pos
-        return None
-
-    def __parse_link_token(
-        self,
-        is_image: bool,
-        text: str,
-        attrs: Optional[Dict[str, Any]],
-        state: InlineState,
-    ) -> Dict[str, Any]:
-        new_state = state.copy()
-        new_state.src = text
-        if is_image:
-            new_state.in_image = True
-            token = {
-                "type": "image",
-                "children": self.render(new_state),
-                "attrs": attrs,
-            }
-        else:
-            new_state.in_link = True
-            token = {
-                "type": "link",
-                "children": self.render(new_state),
-                "attrs": attrs,
-            }
-        return token
+    def parse_link_close(self, m: Match[str], state: InlineState) -> int:
+        return parse_link_close(self, m, state)
 
     def parse_auto_link(self, m: Match[str], state: InlineState) -> int:
         text = m.group(0)
         pos = m.end()
-        if state.in_link:
+        if state.in_link or state.depth >= self.max_nested_level:
             self.process_text(text, state)
             return pos
 
@@ -220,7 +187,7 @@ class InlineParser(Parser[InlineState]):
     def parse_auto_email(self, m: Match[str], state: InlineState) -> int:
         text = m.group(0)
         pos = m.end()
-        if state.in_link:
+        if state.in_link or state.depth >= self.max_nested_level:
             self.process_text(text, state)
             return pos
 
@@ -235,78 +202,27 @@ class InlineParser(Parser[InlineState]):
                 "type": "link",
                 "children": [{"type": "text", "raw": text}],
                 "attrs": {"url": escape_url(url)},
+                "_autolink": "<" + text + ">",
             }
         )
 
     def parse_emphasis(self, m: Match[str], state: InlineState) -> int:
-        pos = m.end()
-
-        marker = m.group(0)
-        mlen = len(marker)
-        if mlen == 1 and state.in_emphasis:
-            state.append_token({"type": "text", "raw": marker})
-            return pos
-        elif mlen == 2 and state.in_strong:
-            state.append_token({"type": "text", "raw": marker})
-            return pos
-
-        _end_re = EMPHASIS_END_RE[marker]
-        m1 = _end_re.search(state.src, pos)
-        if not m1:
-            state.append_token({"type": "text", "raw": marker})
-            return pos
-
-        end_pos = m1.end()
-        text = state.src[pos : end_pos - mlen]
-
-        prec_pos = self.precedence_scan(m, state, end_pos)
-        if prec_pos:
-            return prec_pos
-
-        new_state = state.copy()
-        new_state.src = text
-        if mlen == 1:
-            new_state.in_emphasis = True
-            children = self.render(new_state)
-            state.append_token({"type": "emphasis", "children": children})
-        elif mlen == 2:
-            new_state.in_strong = True
-            children = self.render(new_state)
-            state.append_token({"type": "strong", "children": children})
-        else:
-            new_state.in_emphasis = True
-            new_state.in_strong = True
-
-            children = [{"type": "strong", "children": self.render(new_state)}]
-            state.append_token(
-                {
-                    "type": "emphasis",
-                    "children": children,
-                }
-            )
-        return end_pos
+        # Delimiter flanking and matching are resolved together after scanning.
+        self.process_text(m.group(0), state)
+        return m.end()
 
     def parse_codespan(self, m: Match[str], state: InlineState) -> int:
         marker = m.group(0)
-        # require same marker with same length at end
-
-        pattern = re.compile(r"(.*?[^`])" + marker + r"(?!`)", re.S)
-
         pos = m.end()
-        m2 = pattern.match(state.src, pos)
-        if m2:
-            end_pos = m2.end()
-            code = m2.group(1)
-            # Line endings are treated like spaces
-            code = code.replace("\n", " ")
-            if len(code.strip()):
-                if code.startswith(" ") and code.endswith(" "):
-                    code = code[1:-1]
-            state.append_token({"type": "codespan", "raw": code})
-            return end_pos
-        else:
+        end = state.delimiters.code_end(marker, pos)
+        if end is None:
             state.append_token({"type": "text", "raw": marker})
             return pos
+        code = state.src[pos:end].replace("\n", " ")
+        if code.strip(" ") and code.startswith(" ") and code.endswith(" "):
+            code = code[1:-1]
+        state.append_token({"type": "codespan", "raw": code})
+        return end + len(marker)
 
     def parse_linebreak(self, m: Match[str], state: InlineState) -> int:
         state.append_token({"type": "linebreak"})
@@ -316,9 +232,38 @@ class InlineParser(Parser[InlineState]):
         state.append_token({"type": "softbreak"})
         return m.end()
 
-    def parse_inline_html(self, m: Match[str], state: InlineState) -> int:
-        end_pos = m.end()
-        html = m.group(0)
+    def parse_inline_html(self, m: Match[str], state: InlineState) -> Optional[int]:
+        start = m.start()
+        src = state.src
+        if src.startswith("<!-->", start):
+            end_pos = start + 5
+        elif src.startswith("<!--->", start):
+            end_pos = start + 6
+        else:
+            marker = None
+            offset = 0
+            if src.startswith("<!--", start):
+                marker, offset = "-->", 4
+            elif src.startswith("<?", start):
+                marker, offset = "?>", 2
+            elif src.startswith("<![CDATA[", start):
+                marker, offset = "]]>", 9
+            elif src.startswith("<!", start):
+                declaration = _HTML_DECLARATION_START.match(src, start)
+                if declaration is None:
+                    return None
+                marker, offset = ">", declaration.end() - start
+            if marker is not None:
+                close = state.delimiters.find(marker, start + offset)
+                if close is None:
+                    return None
+                end_pos = close + len(marker)
+            else:
+                tag = _INLINE_HTML_TAG.match(src, start)
+                if tag is None:
+                    return None
+                end_pos = tag.end()
+        html = src[start:end_pos]
         state.append_token({"type": "inline_html", "raw": html})
         if html.startswith(("<a ", "<a>", "<A ", "<A>")):
             state.in_link = True
@@ -326,15 +271,32 @@ class InlineParser(Parser[InlineState]):
             state.in_link = False
         return end_pos
 
-    def process_text(self, text: str, state: InlineState) -> None:
-        state.append_token({"type": "text", "raw": text})
+    def process_text(self, text: str, state: InlineState, parse_emphasis: bool = True) -> None:
+        token: Dict[str, Any] = {"type": "text", "raw": text}
+        if not parse_emphasis:
+            token["_emphasis"] = False
+        state.append_token(token)
 
     def parse(self, state: InlineState) -> List[Dict[str, Any]]:
         pos = 0
         sc = self.compile_sc()
         while pos < len(state.src):
-            m = sc.search(state.src, pos)
+            fast_end = self._find_fast_text_end(state.src, pos)
+            if fast_end is None:
+                m = sc.search(state.src, pos)
+            else:
+                if fast_end > pos:
+                    self.process_text(state.src[pos:fast_end], state)
+                    pos = fast_end
+                if pos >= len(state.src):
+                    break
+                m = sc.match(state.src, pos)
+
             if not m:
+                if fast_end is not None:
+                    self.process_text(state.src[pos : pos + 1], state)
+                    pos += 1
+                    continue
                 break
 
             end_pos = m.start()
@@ -356,7 +318,58 @@ class InlineParser(Parser[InlineState]):
             self.process_text(state.src, state)
         elif pos < len(state.src):
             self.process_text(state.src[pos:], state)
+        state.tokens = self.finalize_tokens(state.tokens, state.depth)
         return state.tokens
+
+    def finalize_tokens(self, tokens: List[Dict[str, Any]], depth: int) -> List[Dict[str, Any]]:
+        remaining = self.max_nested_level - depth
+        return finalize_emphasis_tokens(tokens, "emphasis" in self.rules and remaining > 0, remaining)
+
+    def _find_fast_text_end(self, src: str, pos: int) -> Optional[int]:
+        chars = self._get_fast_trigger_chars()
+        if chars is None:
+            return None
+
+        trigger_re = self._get_fast_trigger_re(chars)
+        m = trigger_re.search(src, pos)
+        if m is None:
+            return len(src)
+
+        if m.group(0) == "\n":
+            return self._find_linebreak_start(src, pos, m.start())
+        return m.start()
+
+    def _get_fast_trigger_re(self, chars: Set[str]) -> re.Pattern[str]:
+        key = tuple(sorted(chars))
+        if self._fast_trigger_re is None or self._fast_trigger_re_chars != key:
+            pattern = "[" + re.escape("".join(key)) + "]"
+            self._fast_trigger_re = re.compile(pattern)
+            self._fast_trigger_re_chars = key
+        assert self._fast_trigger_re is not None
+        return self._fast_trigger_re
+
+    def _find_linebreak_start(self, src: str, min_pos: int, newline_pos: int) -> int:
+        pos = newline_pos
+        while pos > min_pos and src[pos - 1] == " ":
+            pos -= 1
+        if pos == newline_pos and pos > min_pos and src[pos - 1] == "\\":
+            return pos - 1
+        return pos
+
+    def _get_fast_trigger_chars(self) -> Optional[Set[str]]:
+        chars = self._fast_trigger_chars
+        if chars is not None:
+            return chars
+
+        chars = set()
+        for name in self.rules:
+            rule_chars = self._rule_start_chars.get(name, _KNOWN_RULE_START_CHARS.get(name))
+            if rule_chars is None:
+                self._fast_trigger_chars = None
+                return None
+            chars.update(rule_chars)
+        self._fast_trigger_chars = chars
+        return chars
 
     def precedence_scan(
         self,
@@ -404,3 +417,14 @@ class InlineParser(Parser[InlineState]):
         state = self.state_cls(env)
         state.src = s
         return self.render(state)
+
+
+def _normalize_start_chars(start_chars: Union[str, Iterable[str]]) -> Set[str]:
+    if isinstance(start_chars, str):
+        values = [start_chars]
+    else:
+        values = list(start_chars)
+
+    if not values or any(not isinstance(value, str) or len(value) != 1 for value in values):
+        raise ValueError("start_chars must contain one or more single-character strings")
+    return set(values)

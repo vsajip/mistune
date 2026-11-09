@@ -1,37 +1,32 @@
 import re
-from typing import Optional, List, Tuple, Match, Pattern
 import string
-from .util import (
-    unikey,
-    escape_url,
-    expand_tab,
-    expand_leading_tab,
-)
-from .core import Parser, BlockState
+from bisect import bisect_left
+from typing import List, Match, Optional, Pattern, Set, Tuple
+
+from .core import DEFAULT_MAX_NESTED_LEVEL, BlockState, Parser
 from .helpers import (
-    LINK_LABEL,
-    HTML_TAGNAME,
-    HTML_ATTRIBUTES,
     BLOCK_TAGS,
+    HTML_ATTRIBUTES,
+    HTML_TAGNAME,
+    LINK_LABEL,
     PRE_TAGS,
-    unescape_char,
     parse_link_href,
     parse_link_title,
+    unescape_char,
 )
-from .list_parser import parse_list, LIST_PATTERN
+from .list_parser import LIST_PATTERN, parse_list
+from .util import escape_url, expand_leading_tab, expand_tab, unikey
 
 _INDENT_CODE_TRIM = re.compile(r"^ {1,4}", flags=re.M)
 _ATX_HEADING_TRIM = re.compile(r"(\s+|^)#+\s*$")
 _BLOCK_QUOTE_TRIM = re.compile(r"^ ?", flags=re.M)
-_BLOCK_QUOTE_LEADING = re.compile(r"^ *>", flags=re.M)
 
-_LINE_BLANK_END = re.compile(r"\n[ \t]*\n$")
 _BLANK_TO_LINE = re.compile(r"[ \t]*\n")
 
 _BLOCK_TAGS_PATTERN = "(" + "|".join(BLOCK_TAGS) + "|" + "|".join(PRE_TAGS) + ")"
 _OPEN_TAG_END = re.compile(HTML_ATTRIBUTES + r"[ \t]*>[ \t]*(?:\n|$)")
 _CLOSE_TAG_END = re.compile(r"[ \t]*>[ \t]*(?:\n|$)")
-_STRICT_BLOCK_QUOTE = re.compile(r"( {0,3}>[^\n]*(?:\n|$))+")
+_BLOCK_QUOTE_LINE = re.compile(r"^ {0,3}>([^\n]*(?:\n|$))")
 
 
 class BlockParser(Parser[BlockState]):
@@ -94,7 +89,7 @@ class BlockParser(Parser[BlockState]):
         self,
         block_quote_rules: Optional[List[str]] = None,
         list_rules: Optional[List[str]] = None,
-        max_nested_level: int = 6,
+        max_nested_level: int = DEFAULT_MAX_NESTED_LEVEL,
     ):
         super(BlockParser, self).__init__()
 
@@ -104,6 +99,8 @@ class BlockParser(Parser[BlockState]):
         if list_rules is None:
             list_rules = list(self.DEFAULT_RULES)
 
+        if max_nested_level < 1:
+            raise ValueError("max_nested_level must be positive")
         self.block_quote_rules = block_quote_rules
         self.list_rules = list_rules
         self.max_nested_level = max_nested_level
@@ -112,7 +109,10 @@ class BlockParser(Parser[BlockState]):
 
     def parse_blank_line(self, m: Match[str], state: BlockState) -> int:
         """Parse token for blank lines."""
-        state.append_token({"type": "blank_line"})
+        if state.cursor == 0:
+            state.append_token({"type": "blank_line", "newlines": m.group(0).count("\n")})
+        else:
+            state.append_token({"type": "blank_line"})
         return m.end()
 
     def parse_thematic_break(self, m: Match[str], state: BlockState) -> int:
@@ -129,11 +129,14 @@ class BlockParser(Parser[BlockState]):
             return end_pos
 
         code = m.group(0)
+        end_pos = _trim_partial_next_line_indent(code, m.end())
+        if end_pos != m.end():
+            code = state.get_text(end_pos)
         code = expand_leading_tab(code)
         code = _INDENT_CODE_TRIM.sub("", code)
         code = code.strip("\n")
         state.append_token({"type": "block_code", "raw": code, "style": "indent"})
-        return m.end()
+        return end_pos
 
     def parse_fenced_code(self, m: Match[str], state: BlockState) -> Optional[int]:
         """Parse token for fenced code block. A fenced code block is started with
@@ -203,6 +206,9 @@ class BlockParser(Parser[BlockState]):
             H1 title
             ========
         """
+        if state.cursor in state.lazy_line_starts:
+            return None
+
         last_token = state.last_token()
         if last_token and last_token["type"] == "paragraph":
             level = 1 if m.group("setext_1") == "=" else 2
@@ -244,17 +250,17 @@ class BlockParser(Parser[BlockState]):
         if not key:
             return None
 
-        href, href_pos = parse_link_href(state.src, m.end(), block=True)
+        href, href_pos = parse_link_href(state.src, m.end(), block=True, max_nested_level=self.max_nested_level)
         if href is None:
             return None
 
         assert href_pos is not None
 
-        _blank = self.BLANK_LINE.search(state.src, href_pos)
-        if _blank:
-            max_pos = _blank.start()
-        else:
+        blank_pos = _find_next_blank_line(state, href_pos, self.BLANK_LINE)
+        if blank_pos is None:
             max_pos = state.cursor_max
+        else:
+            max_pos = blank_pos
 
         title, title_pos = parse_link_title(state.src, href_pos, max_pos)
         if title_pos:
@@ -286,29 +292,26 @@ class BlockParser(Parser[BlockState]):
             state.env["ref_links"][key] = data
         return end_pos
 
-    def extract_block_quote(self, m: Match[str], state: BlockState) -> Tuple[str, Optional[int]]:
+    def extract_block_quote(self, m: Match[str], state: BlockState) -> Tuple[str, Optional[int], Set[int]]:
         """Extract text and cursor end position of a block quote."""
 
-        # cleanup at first to detect if it is code block
-        text = m.group("quote_1") + "\n"
-        text = expand_leading_tab(text, 3)
-        text = _BLOCK_QUOTE_TRIM.sub("", text)
+        text = _parse_block_quote_line(state.get_line(state.cursor))
+        assert text is not None
+        lazy_line_starts: Set[int] = set()
 
         sc = self.compile_sc(["blank_line", "indent_code", "fenced_code"])
         require_marker = bool(sc.match(text))
 
-        state.cursor = m.end() + 1
+        state.cursor += len(state.get_line(state.cursor))
 
         end_pos: Optional[int] = None
         if require_marker:
-            m2 = _STRICT_BLOCK_QUOTE.match(state.src, state.cursor)
-            if m2:
-                quote = m2.group(0)
-                quote = _BLOCK_QUOTE_LEADING.sub("", quote)
-                quote = expand_leading_tab(quote, 3)
-                quote = _BLOCK_QUOTE_TRIM.sub("", quote)
+            while state.cursor < state.cursor_max:
+                quote = _parse_block_quote_line(state.get_line(state.cursor))
+                if quote is None:
+                    break
                 text += quote
-                state.cursor = m2.end()
+                state.cursor += len(state.get_line(state.cursor))
         else:
             prev_blank_line = False
             break_sc = self.compile_sc(
@@ -321,18 +324,14 @@ class BlockParser(Parser[BlockState]):
                 ]
             )
             while state.cursor < state.cursor_max:
-                m3 = _STRICT_BLOCK_QUOTE.match(state.src, state.cursor)
-                if m3:
-                    quote = m3.group(0)
-                    quote = _BLOCK_QUOTE_LEADING.sub("", quote)
-                    quote = expand_leading_tab(quote, 3)
-                    quote = _BLOCK_QUOTE_TRIM.sub("", quote)
+                quote = _parse_block_quote_line(state.get_line(state.cursor))
+                if quote is not None:
                     text += quote
-                    state.cursor = m3.end()
+                    state.cursor += len(state.get_line(state.cursor))
                     if not quote.strip():
                         prev_blank_line = True
                     else:
-                        prev_blank_line = bool(_LINE_BLANK_END.search(quote))
+                        prev_blank_line = False
                     continue
 
                 if prev_blank_line:
@@ -348,15 +347,14 @@ class BlockParser(Parser[BlockState]):
                         break
 
                 # lazy continuation line
-                pos = state.find_line_end()
-                line = state.get_text(pos)
-                line = expand_leading_tab(line, 3)
-                text += line
-                state.cursor = pos
+                line = state.get_line(state.cursor)
+                lazy_line_starts.add(len(text))
+                text += expand_leading_tab(line, 3)
+                state.cursor += len(line)
 
         # according to CommonMark Example 6, the second tab should be
         # treated as 4 spaces
-        return expand_tab(text), end_pos
+        return expand_tab(text), end_pos, lazy_line_starts
 
     def parse_block_quote(self, m: Match[str], state: BlockState) -> int:
         """Parse token for block quote. Here is an example of the syntax:
@@ -366,12 +364,14 @@ class BlockParser(Parser[BlockState]):
             > a block quote starts
             > with right arrows
         """
-        text, end_pos = self.extract_block_quote(m, state)
+        text, end_pos, lazy_line_starts = self.extract_block_quote(m, state)
         # scan children state
-        child = state.child_state(text)
+        child = state.child_state(text, lazy_line_starts=lazy_line_starts)
         if state.depth() >= self.max_nested_level - 1:
-            rules = list(self.block_quote_rules)
-            rules.remove("block_quote")
+            # At the nesting limit, stop descending into any further container
+            # blocks. Trimming only "block_quote" still allowed block quotes and
+            # lists to recurse into each other without bound (RecursionError).
+            rules = [rule for rule in self.block_quote_rules if rule not in ("block_quote", "list")]
         else:
             rules = self.block_quote_rules
 
@@ -442,10 +442,23 @@ class BlockParser(Parser[BlockState]):
         return None
 
     def parse(self, state: BlockState, rules: Optional[List[str]] = None) -> None:
+        if rules is None:
+            rules = self.rules
         sc = self.compile_sc(rules)
 
         while state.cursor < state.cursor_max:
-            m = sc.search(state.src, state.cursor)
+            if "indent_code" in rules:
+                end_pos = self._parse_indent_code_fast(state)
+                if end_pos is not None:
+                    state.cursor = end_pos
+                    continue
+
+            m = sc.match(state.src, state.cursor)
+            if not m and self._parse_plain_paragraph(state, sc):
+                continue
+
+            if not m:
+                m = sc.search(state.src, state.cursor)
             if not m:
                 break
 
@@ -468,6 +481,45 @@ class BlockParser(Parser[BlockState]):
             text = state.src[state.cursor :]
             state.add_paragraph(text)
             state.cursor = state.cursor_max
+
+    def _parse_indent_code_fast(self, state: BlockState) -> Optional[int]:
+        line_end = state.find_line_end()
+        line = state.get_text(line_end)
+        if not _is_indent_code_line(line):
+            return None
+
+        if state.last_token() and state.last_token()["type"] == "paragraph":
+            return state.append_paragraph()
+
+        end_pos = _find_indent_code_end(state.src, line_end, state.cursor_max)
+        code = state.get_text(end_pos)
+        code = expand_leading_tab(code)
+        code = _INDENT_CODE_TRIM.sub("", code)
+        code = code.strip("\n")
+        state.append_token({"type": "block_code", "raw": code, "style": "indent"})
+        return end_pos
+
+    def _parse_plain_paragraph(self, state: BlockState, sc: Pattern[str]) -> bool:
+        if not _is_plain_paragraph_start(state.src, state.cursor):
+            return False
+
+        pos = state.cursor
+        while pos < state.cursor_max:
+            if pos > state.cursor and sc.match(state.src, pos):
+                break
+
+            line = state.get_line(pos)
+            if not line.strip():
+                break
+
+            pos += len(line)
+
+        if pos <= state.cursor:
+            return False
+
+        state.add_paragraph(state.get_text(pos))
+        state.cursor = pos
+        return True
 
 
 def _parse_html_to_end(state: BlockState, end_marker: str, start_pos: int) -> int:
@@ -496,3 +548,68 @@ def _parse_html_to_newline(state: BlockState, newline: Pattern[str]) -> int:
 
     state.append_token({"type": "block_html", "raw": text})
     return end_pos
+
+
+def _parse_block_quote_line(line: str) -> Optional[str]:
+    m = _BLOCK_QUOTE_LINE.match(line)
+    if not m:
+        return None
+    text = expand_leading_tab(m.group(1), 3)
+    return _BLOCK_QUOTE_TRIM.sub("", text)
+
+
+def _find_next_blank_line(state: BlockState, pos: int, pattern: Pattern[str]) -> Optional[int]:
+    cache = state.env.get("__blank_line_starts__")
+    if cache is None or cache[0] is not state.src:
+        cache = (state.src, [m.start() for m in pattern.finditer(state.src)])
+        state.env["__blank_line_starts__"] = cache
+
+    positions = cache[1]
+    index = bisect_left(positions, pos)
+    if index < len(positions):
+        return positions[index]
+    return None
+
+
+def _trim_partial_next_line_indent(text: str, end_pos: int) -> int:
+    line_start = text.rfind("\n") + 1
+    if line_start == 0:
+        return end_pos
+
+    suffix = text[line_start:]
+    if suffix and suffix.strip(" \t") == "" and len(suffix.expandtabs(4)) < 4:
+        return end_pos - len(suffix)
+    return end_pos
+
+
+def _is_indent_code_line(line: str) -> bool:
+    if line.endswith("\n"):
+        line = line[:-1]
+
+    if len(line) > 4 and line.startswith("    "):
+        return True
+
+    index = 0
+    while index < len(line) and line[index] == " ":
+        index += 1
+    return index + 1 < len(line) and line[index] == "\t"
+
+
+def _find_indent_code_end(src: str, start: int, end: int) -> int:
+    pos = start
+    while pos < end:
+        newline = src.find("\n", pos, end)
+        line_end = end if newline < 0 else newline + 1
+        line = src[pos:line_end]
+        if _is_indent_code_line(line) or not line.strip():
+            pos = line_end
+            continue
+        break
+    return pos
+
+
+def _is_plain_paragraph_start(src: str, pos: int) -> bool:
+    if pos >= len(src):
+        return False
+    c = src[pos]
+    return not c.isspace() and not c.isdigit() and c not in string.punctuation

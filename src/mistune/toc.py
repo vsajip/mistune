@@ -1,10 +1,13 @@
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
+import re
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from .core import BlockState
-from .util import striptags
+from .util import escape, striptags
 
 if TYPE_CHECKING:
     from .markdown import Markdown
+
+_HTML_ID_RE = re.compile(r"""\bid\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
 
 
 def add_toc_hook(
@@ -32,9 +35,13 @@ def add_toc_hook(
     :param heading_id: a function to generate heading_id
     """
     if heading_id is None:
+        auto_heading_id = True
 
         def heading_id(token: Dict[str, Any], index: int) -> str:
             return "toc_" + str(index + 1)
+
+    else:
+        auto_heading_id = False
 
     def toc_hook(md: "Markdown", state: "BlockState") -> None:
         headings = []
@@ -45,15 +52,43 @@ def add_toc_hook(
                 if min_level <= level <= max_level:
                     headings.append(tok)
 
+        id_allocator = _HeadingIdAllocator(state, headings)
         toc_items = []
         for i, tok in enumerate(headings):
-            tok["attrs"]["id"] = heading_id(tok, i)
+            if not tok["attrs"].get("id"):
+                value = heading_id(tok, i)
+                id_allocator.assign(tok, value, ensure_unique=auto_heading_id)
             toc_items.append(normalize_toc_item(md, tok, parent=state))
 
         # save items into state
         state.env["toc_items"] = toc_items
 
     md.before_render_hooks.append(toc_hook)
+
+
+class _HeadingIdAllocator:
+    def __init__(self, state: "BlockState", headings: Iterable[Dict[str, Any]]) -> None:
+        self.used_ids: Set[str] = {m.group(1) or m.group(2) for m in _HTML_ID_RE.finditer(state.src)}
+        for token in headings:
+            value = token.get("attrs", {}).get("id")
+            if value:
+                self.used_ids.add(value)
+
+    def assign(self, token: Dict[str, Any], value: str, ensure_unique: bool = True) -> str:
+        if ensure_unique:
+            value = self._unique(value)
+        self.used_ids.add(value)
+        token["attrs"]["id"] = value
+        return value
+
+    def _unique(self, value: str) -> str:
+        if value not in self.used_ids:
+            return value
+
+        index = 1
+        while value + "_" + str(index) in self.used_ids:
+            index += 1
+        return value + "_" + str(index)
 
 
 def normalize_toc_item(md: "Markdown", token: Dict[str, Any], parent: Optional[Any] = None) -> Tuple[int, str, str]:
@@ -89,7 +124,7 @@ def render_toc_ul(toc: Iterable[Tuple[int, str, str]]) -> str:
     s = ""
     levels: List[int] = []
     for level, k, text in toc:
-        item = '<a href="#{}">{}</a>'.format(k, text)
+        item = '<a href="#{}">{}</a>'.format(escape(k), text)
         if not levels:
             s += "<li>" + item
             levels.append(level)

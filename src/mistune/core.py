@@ -1,6 +1,6 @@
 import re
-import sys
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     ClassVar,
@@ -12,18 +12,20 @@ from typing import (
     MutableMapping,
     Optional,
     Pattern,
+    Self,
+    Set,
     Type,
     TypeVar,
     Union,
     cast,
 )
 
-if sys.version_info >= (3, 11):
-    from typing import Self
-else:
-    from typing_extensions import Self
+from ._inline.delimiters import DelimiterScanner
 
-_LINE_END = re.compile(r"\n|$")
+if TYPE_CHECKING:
+    from ._inline.links import Bracket
+
+DEFAULT_MAX_NESTED_LEVEL = 20
 
 
 class BlockState:
@@ -36,6 +38,7 @@ class BlockState:
     list_tight: bool
     parent: Any
     env: MutableMapping[str, Any]
+    lazy_line_starts: Set[int]
 
     def __init__(self, parent: Optional[Any] = None) -> None:
         self.src = ""
@@ -48,6 +51,7 @@ class BlockState:
         # for list and block quote chain
         self.list_tight = True
         self.parent = parent
+        self.lazy_line_starts = set()
 
         # for saving def references
         if parent:
@@ -55,9 +59,11 @@ class BlockState:
         else:
             self.env = {"ref_links": {}}
 
-    def child_state(self, src: str) -> "BlockState":
+    def child_state(self, src: str, lazy_line_starts: Optional[Set[int]] = None) -> "BlockState":
         child = self.__class__(self)
         child.process(src)
+        if lazy_line_starts:
+            child.lazy_line_starts = lazy_line_starts
         return child
 
     def process(self, src: str) -> None:
@@ -65,12 +71,19 @@ class BlockState:
         self.cursor_max = len(src)
 
     def find_line_end(self) -> int:
-        m = _LINE_END.search(self.src, self.cursor)
-        assert m is not None
-        return m.end()
+        return self.find_line_end_at(self.cursor)
+
+    def find_line_end_at(self, pos: int) -> int:
+        end = self.src.find("\n", pos)
+        if end < 0:
+            return len(self.src)
+        return end + 1
 
     def get_text(self, end_pos: int) -> str:
         return self.src[self.cursor : end_pos]
+
+    def get_line(self, start_pos: int) -> str:
+        return self.src[start_pos : self.find_line_end_at(start_pos)]
 
     def last_token(self) -> Any:
         if self.tokens:
@@ -116,9 +129,11 @@ class InlineState:
         self.src = ""
         self.tokens: List[Dict[str, Any]] = []
         self.in_image = False
+        self.depth = 0
         self.in_link = False
-        self.in_emphasis = False
-        self.in_strong = False
+        self.brackets: List["Bracket"] = []
+        self.last_link: Optional["Bracket"] = None
+        self._delimiters: Optional[DelimiterScanner] = None
 
     def prepend_token(self, token: Dict[str, Any]) -> None:
         """Insert token before the last token."""
@@ -127,15 +142,37 @@ class InlineState:
     def append_token(self, token: Dict[str, Any]) -> None:
         """Add token to the end of token list."""
         self.tokens.append(token)
+        if self.brackets and "children" in token:
+            bracket = self.brackets[-1]
+            if "_autolink" not in token or bracket.image:
+                bracket.child_depth = max(bracket.child_depth, token_depth([token]))
 
     def copy(self) -> "InlineState":
         """Create a copy of current state."""
         state = self.__class__(self.env)
         state.in_image = self.in_image
+        state.depth = self.depth + 1
         state.in_link = self.in_link
-        state.in_emphasis = self.in_emphasis
-        state.in_strong = self.in_strong
         return state
+
+    @property
+    def delimiters(self) -> DelimiterScanner:
+        if self._delimiters is None or self._delimiters.src is not self.src:
+            self._delimiters = DelimiterScanner(self.src)
+        return self._delimiters
+
+
+def token_depth(tokens: List[Dict[str, Any]]) -> int:
+    """Count all inline containers, including mixed plugin and core syntax."""
+    maximum = 0
+    stack = [(token, 0) for token in tokens]
+    while stack:
+        token, depth = stack.pop()
+        if "children" in token:
+            depth += 1
+            maximum = max(maximum, depth)
+            stack.extend((child, depth) for child in token["children"])
+    return maximum
 
 
 ST = TypeVar("ST", InlineState, BlockState)
@@ -190,6 +227,7 @@ class Parser(Generic[ST]):
         :param before: insert this rule before a built-in rule
         """
         self._methods[name] = lambda m, state: func(self, m, state)
+        self.__sc.clear()
         if pattern:
             self.specification[name] = pattern
         if name not in self.rules:
@@ -235,7 +273,7 @@ class BaseRenderer(object):
 
     def _get_method(self, name: str) -> Callable[..., str]:
         try:
-            return cast(Callable[..., str], object.__getattribute__(self, name))
+            return cast("Callable[..., str]", object.__getattribute__(self, name))
         except AttributeError:
             method = self.__methods.get(name)
             if not method:

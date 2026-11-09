@@ -18,10 +18,10 @@ cover/
 *.c
 *.so
 .venv/
+plans/
 .python-version
 .coverage
 htmlcov
 .eggs
 coverage.xml
 demo.py
-uv.lock

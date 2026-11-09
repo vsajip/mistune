@@ -55,3 +55,78 @@ with $a\neq b$ such that $f(a)=f(b)$.
 singleton set <span class="math">\(e_G\)</span>, because otherwise <span class="math">\(\exists a,b\in G\)</span>
 with <span class="math">\(a\neq b\)</span> such that <span class="math">\(f(a)=f(b)\)</span>.</p>
 ````````````````````````````````
+
+```````````````````````````````` example
+Escaped dollar sign in math: $x=\$$
+.
+<p>Escaped dollar sign in math: <span class="math">\(x=\$\)</span></p>
+````````````````````````````````
+
+```````````````````````````````` example
+The $n$th element is valid.
+.
+<p>The <span class="math">\(n\)</span>th element is valid.</p>
+````````````````````````````````
+
+```````````````````````````````` example
+Result is $x^2$.
+.
+<p>Result is <span class="math">\(x^2\)</span>.</p>
+````````````````````````````````
+
+```````````````````````````````` example
+$$x$$
+.
+<div class="math">$$
+x
+$$</div>
+````````````````````````````````
+
+```````````````````````````````` example
+$$$$
+.
+<div class="math">$$
+
+$$</div>
+````````````````````````````````
+
+```````````````````````````````` example
+No newline $$x$$
+.
+<p>No newline <div class="math">$$
+x
+$$</div>
+</p>
+````````````````````````````````
+
+```````````````````````````````` example
+$`a+%
+b`$
+.
+<p><span class="math">\(a+%
+b\)</span></p>
+````````````````````````````````
+
+## Currency rejection
+
+```````````````````````````````` example
+Price is $51,300 and cost is $51,300 total.
+.
+<p>Price is $51,300 and cost is $51,300 total.</p>
+````````````````````````````````
+
+```````````````````````````````` example
+The $1.6T valuation narrative.
+.
+<p>The $1.6T valuation narrative.</p>
+````````````````````````````````
+
+## Cross-line rejection
+
+```````````````````````````````` example
+Line one $500
+Line two $600
+.
+<p>Line one $500
+Line two $600</p>
+````````````````````````````````

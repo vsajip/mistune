@@ -1,5 +1,5 @@
 import re
-from typing import TYPE_CHECKING, Match
+from typing import TYPE_CHECKING, Match, Optional
 
 if TYPE_CHECKING:
     from ..block_parser import BlockParser
@@ -12,11 +12,11 @@ __all__ = ["spoiler"]
 _BLOCK_SPOILER_START = re.compile(r"^ {0,3}! ?", re.M)
 _BLOCK_SPOILER_MATCH = re.compile(r"^( {0,3}![^\n]*\n)+$")
 
-INLINE_SPOILER_PATTERN = r">!\s*(?P<spoiler_text>.+?)\s*!<"
+INLINE_SPOILER_PATTERN = r">!"
 
 
 def parse_block_spoiler(block: "BlockParser", m: Match[str], state: "BlockState") -> int:
-    text, end_pos = block.extract_block_quote(m, state)
+    text, end_pos, lazy_line_starts = block.extract_block_quote(m, state)
     if not text.endswith("\n"):
         # ensure it endswith \n to make sure
         # _BLOCK_SPOILER_MATCH.match works
@@ -30,7 +30,7 @@ def parse_block_spoiler(block: "BlockParser", m: Match[str], state: "BlockState"
         tok_type = "block_quote"
 
     # scan children state
-    child = state.child_state(text)
+    child = state.child_state(text, lazy_line_starts=lazy_line_starts)
     if state.depth() >= block.max_nested_level - 1:
         rules = list(block.block_quote_rules)
         rules.remove("block_quote")
@@ -46,13 +46,21 @@ def parse_block_spoiler(block: "BlockParser", m: Match[str], state: "BlockState"
     return state.cursor
 
 
-def parse_inline_spoiler(inline: "InlineParser", m: Match[str], state: "InlineState") -> int:
-    text = m.group("spoiler_text")
+def parse_inline_spoiler(inline: "InlineParser", m: Match[str], state: "InlineState") -> Optional[int]:
+    if state.depth >= inline.max_nested_level:
+        return None
+    pos = m.end()
+    close = state.delimiters.find("!<", pos + 1)
+    if close is None or state.src.find("\n", pos, close) >= 0:
+        return None
+    text = state.src[pos:close].strip()
+    if not text:
+        return None
     new_state = state.copy()
     new_state.src = text
     children = inline.render(new_state)
     state.append_token({"type": "inline_spoiler", "children": children})
-    return m.end()
+    return close + 2
 
 
 def render_block_spoiler(renderer: "BaseRenderer", text: str) -> str:

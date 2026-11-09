@@ -17,7 +17,7 @@ def _md(args: argparse.Namespace) -> "Markdown":
         plugins = args.plugin
     else:
         # default plugins
-        plugins = ["strikethrough", "footnotes", "table", "speedup"]
+        plugins = ["strikethrough", "footnotes", "table"]
 
     if args.renderer == "rst":
         renderer: "BaseRenderer" = RSTRenderer()
@@ -35,15 +35,16 @@ def _md(args: argparse.Namespace) -> "Markdown":
 
 def _output(text: str, args: argparse.Namespace) -> None:
     if args.output:
-        with open(args.output, "w") as f:
+        with open(args.output, "w", encoding="utf-8") as f:
             f.write(text)
     else:
+        _ensure_stdout_utf8()
         print(text)
 
 
-CMD_HELP = """Mistune, a sane and fast python markdown parser.
+CMD_HELP = """Mistune, a sane and fast Python Markdown parser.
 
-Here are some use cases of the command line tool:
+Examples:
 
     $ python -m mistune -m "Hi **Markdown**"
     <p>Hi <strong>Markdown</strong></p>
@@ -65,12 +66,12 @@ def cli() -> None:
     parser.add_argument(
         "-m",
         "--message",
-        help="the markdown message to convert",
+        help="the Markdown message to convert",
     )
     parser.add_argument(
         "-f",
         "--file",
-        help="the markdown file to convert",
+        help="the Markdown file to convert",
     )
     parser.add_argument(
         "-p",
@@ -78,17 +79,17 @@ def cli() -> None:
         metavar="NAME",
         action="extend",
         nargs="+",
-        help="specifiy a plugin to use",
+        help="specify a plugin to use",
     )
     parser.add_argument(
         "--escape",
         action="store_true",
-        help="turn on escape option",
+        help="enable the escape option",
     )
     parser.add_argument(
         "--hardwrap",
         action="store_true",
-        help="turn on hardwrap option",
+        help="enable the hardwrap option",
     )
     parser.add_argument(
         "-o",
@@ -119,8 +120,14 @@ def cli() -> None:
         assert isinstance(text, str)
         _output(text, args)
     else:
-        print("You MUST specify a message or file")
+        print("You must specify a message or file")
         sys.exit(1)
+
+
+def _ensure_stdout_utf8() -> None:
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(encoding="utf-8")
 
 
 def read_stdin() -> Optional[str]:

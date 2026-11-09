@@ -1,5 +1,4 @@
-import re
-from typing import TYPE_CHECKING, Match, Optional, Pattern
+from typing import TYPE_CHECKING, Match, Optional
 
 from ..helpers import PREVENT_BACKSLASH
 
@@ -10,16 +9,12 @@ if TYPE_CHECKING:
 
 __all__ = ["strikethrough", "mark", "insert", "superscript", "subscript"]
 
-_STRIKE_END = re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\~|[^\s~])~~(?!~)")
-_MARK_END = re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\=|[^\s=])==(?!=)")
-_INSERT_END = re.compile(r"(?:" + PREVENT_BACKSLASH + r"\\\^|[^\s^])\^\^(?!\^)")
-
 SUPERSCRIPT_PATTERN = r"\^(?:" + PREVENT_BACKSLASH + r"\\\^|\S|\\ )+?\^"
 SUBSCRIPT_PATTERN = r"~(?:" + PREVENT_BACKSLASH + r"\\~|\S|\\ )+?~"
 
 
 def parse_strikethrough(inline: "InlineParser", m: Match[str], state: "InlineState") -> Optional[int]:
-    return _parse_to_end(inline, m, state, "strikethrough", _STRIKE_END)
+    return _parse_to_end(inline, m, state, "strikethrough", "~~")
 
 
 def render_strikethrough(renderer: "BaseRenderer", text: str) -> str:
@@ -27,7 +22,7 @@ def render_strikethrough(renderer: "BaseRenderer", text: str) -> str:
 
 
 def parse_mark(inline: "InlineParser", m: Match[str], state: "InlineState") -> Optional[int]:
-    return _parse_to_end(inline, m, state, "mark", _MARK_END)
+    return _parse_to_end(inline, m, state, "mark", "==")
 
 
 def render_mark(renderer: "BaseRenderer", text: str) -> str:
@@ -35,14 +30,14 @@ def render_mark(renderer: "BaseRenderer", text: str) -> str:
 
 
 def parse_insert(inline: "InlineParser", m: Match[str], state: "InlineState") -> Optional[int]:
-    return _parse_to_end(inline, m, state, "insert", _INSERT_END)
+    return _parse_to_end(inline, m, state, "insert", "^^")
 
 
 def render_insert(renderer: "BaseRenderer", text: str) -> str:
     return "<ins>" + text + "</ins>"
 
 
-def parse_superscript(inline: "InlineParser", m: Match[str], state: "InlineState") -> int:
+def parse_superscript(inline: "InlineParser", m: Match[str], state: "InlineState") -> Optional[int]:
     return _parse_script(inline, m, state, "superscript")
 
 
@@ -50,7 +45,7 @@ def render_superscript(renderer: "BaseRenderer", text: str) -> str:
     return "<sup>" + text + "</sup>"
 
 
-def parse_subscript(inline: "InlineParser", m: Match[str], state: "InlineState") -> int:
+def parse_subscript(inline: "InlineParser", m: Match[str], state: "InlineState") -> Optional[int]:
     return _parse_script(inline, m, state, "subscript")
 
 
@@ -63,14 +58,16 @@ def _parse_to_end(
     m: Match[str],
     state: "InlineState",
     tok_type: str,
-    end_pattern: Pattern[str],
+    marker: str,
 ) -> Optional[int]:
-    pos = m.end()
-    m1 = end_pattern.search(state.src, pos)
-    if not m1:
+    if state.depth >= inline.max_nested_level:
         return None
-    end_pos = m1.end()
-    text = state.src[pos : end_pos - 2]
+    pos = m.end()
+    close = state.delimiters.find(marker, pos, formatting=True)
+    if close is None:
+        return None
+    end_pos = close + len(marker)
+    text = state.src[pos:close]
     new_state = state.copy()
     new_state.src = text
     children = inline.render(new_state)
@@ -78,7 +75,9 @@ def _parse_to_end(
     return end_pos
 
 
-def _parse_script(inline: "InlineParser", m: Match[str], state: "InlineState", tok_type: str) -> int:
+def _parse_script(inline: "InlineParser", m: Match[str], state: "InlineState", tok_type: str) -> Optional[int]:
+    if state.depth >= inline.max_nested_level:
+        return None
     text = m.group(0)
     new_state = state.copy()
     new_state.src = text[1:-1].replace("\\ ", " ")

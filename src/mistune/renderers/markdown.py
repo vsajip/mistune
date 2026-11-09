@@ -4,9 +4,15 @@ from typing import Any, Dict, Iterable, cast
 
 from ..core import BaseRenderer, BlockState
 from ..util import strip_end
-from ._list import render_list
+from ._list import render_list, render_list_item
 
-fenced_re = re.compile(r"^[`~]+", re.M)
+fenced_re = re.compile(r"^ {0,3}([`~]+)", re.M)
+_backtick_run_re = re.compile(r"`+")
+_literal_inline_markers_re = re.compile(r"&(?:#[0-9]+|#[xX][0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]+);|([\\`<!&])")
+
+#: leading markers that would be parsed as a new block (list, heading, block
+#: quote) if they appear unescaped at the start of a line.
+_block_prefix_re = re.compile(r"^(\s*)(>|[-+*]|#{1,6}|\d{1,9}[.)])(\s|$)")
 
 
 class MarkdownRenderer(BaseRenderer):
@@ -15,19 +21,27 @@ class MarkdownRenderer(BaseRenderer):
     NAME = "markdown"
 
     def __call__(self, tokens: Iterable[Dict[str, Any]], state: BlockState) -> str:
-        out = self.render_tokens(tokens, state)
+        tokens = list(tokens)
+        leading = ""
+        i = 0
+        while i < len(tokens) and tokens[i]["type"] == "blank_line" and "newlines" in tokens[i]:
+            leading += "\n" * tokens[i]["newlines"]
+            i += 1
+        out = self.render_tokens(tokens[i:], state)
         # special handle for line breaks
         out += "\n\n".join(self.render_referrences(state)) + "\n"
-        return strip_end(out)
+        return strip_end(leading + out)
 
     def render_referrences(self, state: BlockState) -> Iterable[str]:
         ref_links = state.env["ref_links"]
         for key in ref_links:
             attrs = ref_links[key]
-            text = "[" + attrs["label"] + "]: " + attrs["url"]
+            # An empty destination must be explicit in a reference definition.
+            url = attrs["url"] or "<>"
+            text = "[" + attrs["label"] + "]: " + url
             title = attrs.get("title")
             if title:
-                text += ' "' + title + '"'
+                text += ' "' + _escape_title(title) + '"'
             yield text
 
     def render_children(self, token: Dict[str, Any], state: BlockState) -> str:
@@ -35,13 +49,36 @@ class MarkdownRenderer(BaseRenderer):
         return self.render_tokens(children, state)
 
     def text(self, token: Dict[str, Any], state: BlockState) -> str:
-        return cast(str, token["raw"])
+        raw = cast(str, token["raw"])
+        # a text token that is made up entirely of "*"/"_" is a literal
+        # emphasis delimiter -- either an escaped marker from the source
+        # (``\*``) or an unmatched leftover -- so every character must stay
+        # escaped, or it would re-parse as emphasis on the round-trip. Prose
+        # punctuation such as ``2 * 3`` or ``snake_case`` arrives mixed with
+        # other characters and is left untouched.
+        if raw and all(c in "*_" for c in raw):
+            return "".join("\\" + c for c in raw)
+        # Keep literal escapes, code delimiters, image introducers, HTML
+        # delimiters and entity prefixes from becoming markup on re-parse.
+        # Complete entity references already in this token keep their meaning;
+        # escaped ampersands arrive in a separate text token.
+        return _literal_inline_markers_re.sub(lambda m: "\\" + m[1] if m[1] else m[0], raw)
 
     def emphasis(self, token: Dict[str, Any], state: BlockState) -> str:
         return "*" + self.render_children(token, state) + "*"
 
     def strong(self, token: Dict[str, Any], state: BlockState) -> str:
         return "**" + self.render_children(token, state) + "**"
+
+    # Inline formatting plugins (strikethrough, mark, insert)
+    def strikethrough(self, token: Dict[str, Any], state: BlockState) -> str:
+        return "~~" + self.render_children(token, state) + "~~"
+
+    def mark(self, token: Dict[str, Any], state: BlockState) -> str:
+        return "==" + self.render_children(token, state) + "=="
+
+    def insert(self, token: Dict[str, Any], state: BlockState) -> str:
+        return "^^" + self.render_children(token, state) + "^^"
 
     def link(self, token: Dict[str, Any], state: BlockState) -> str:
         label = cast(str, token.get("label"))
@@ -53,9 +90,9 @@ class MarkdownRenderer(BaseRenderer):
         attrs = token["attrs"]
         url: str = attrs["url"]
         title = attrs.get("title")
-        if text == url and not title:
+        if token["type"] == "link" and text == url and not title:
             return "<" + text + ">"
-        elif "mailto:" + text == url and not title:
+        elif token["type"] == "link" and "mailto:" + text == url and not title:
             return "<" + text + ">"
 
         out += "("
@@ -64,14 +101,28 @@ class MarkdownRenderer(BaseRenderer):
         else:
             out += url
         if title:
-            out += ' "' + title + '"'
+            out += ' "' + _escape_title(title) + '"'
         return out + ")"
 
     def image(self, token: Dict[str, Any], state: BlockState) -> str:
         return "!" + self.link(token, state)
 
     def codespan(self, token: Dict[str, Any], state: BlockState) -> str:
-        return "`" + cast(str, token["raw"]) + "`"
+        code = cast(str, token["raw"])
+        # The delimiter must be a run of backticks longer than any backtick run
+        # inside the content, otherwise the content would close the span early.
+        longest = max((len(run) for run in _backtick_run_re.findall(code)), default=0)
+        fence = "`" * (longest + 1)
+        # Padding separates edge backticks from the delimiter and protects
+        # meaningful spaces at both ends from the parser's space normalization.
+        # All-space content is exempt from that normalization.
+        if (
+            code.startswith("`")
+            or code.endswith("`")
+            or (code.startswith(" ") and code.endswith(" ") and code.strip(" "))
+        ):
+            return fence + " " + code + " " + fence
+        return fence + code + fence
 
     def linebreak(self, token: Dict[str, Any], state: BlockState) -> str:
         return "  \n"
@@ -87,19 +138,29 @@ class MarkdownRenderer(BaseRenderer):
 
     def paragraph(self, token: Dict[str, Any], state: BlockState) -> str:
         text = self.render_children(token, state)
-        return text + "\n\n"
+        return _escape_block_prefix(text) + "\n\n"
 
     def heading(self, token: Dict[str, Any], state: BlockState) -> str:
         level = cast(int, token["attrs"]["level"])
-        marker = "#" * level
         text = self.render_children(token, state)
+        # An ATX heading ("# ...") occupies a single line, so a heading whose
+        # rendered text spans several lines -- a multi-line setext heading --
+        # must be re-emitted in setext form. As ATX the continuation lines
+        # would fall out of the heading and become a paragraph on a re-parse.
+        # Only levels 1 and 2 reach this branch, since an ATX heading never
+        # contains a line break.
+        if "\n" in text and level in (1, 2):
+            underline = "=" if level == 1 else "-"
+            return text + "\n" + underline * 3 + "\n\n"
+        marker = "#" * level
+        text = re.sub(r"(^|[ \t])(#+)$", r"\1\\\2", text)
         return marker + " " + text + "\n\n"
 
     def thematic_break(self, token: Dict[str, Any], state: BlockState) -> str:
         return "***\n\n"
 
     def block_text(self, token: Dict[str, Any], state: BlockState) -> str:
-        return self.render_children(token, state) + "\n"
+        return _escape_block_prefix(self.render_children(token, state)) + "\n"
 
     def block_code(self, token: Dict[str, Any], state: BlockState) -> str:
         attrs = token.get("attrs", {})
@@ -115,8 +176,11 @@ class MarkdownRenderer(BaseRenderer):
         return marker2 + info + "\n" + code + marker2 + "\n\n"
 
     def block_quote(self, token: Dict[str, Any], state: BlockState) -> str:
-        text = indent(self.render_children(token, state), "> ", lambda _: True)
-        text = text.rstrip("> \n")
+        # strip the children's trailing blank lines first so the quote marker is
+        # not added to a dangling empty line; stripping it back off afterwards
+        # would also eat a ">" that ends the content (an autolink or HTML tag).
+        text = self.render_children(token, state).rstrip("\n")
+        text = indent(text, "> ", lambda _: True)
         return text + "\n\n"
 
     def block_html(self, token: Dict[str, Any], state: BlockState) -> str:
@@ -127,6 +191,70 @@ class MarkdownRenderer(BaseRenderer):
 
     def list(self, token: Dict[str, Any], state: BlockState) -> str:
         return render_list(self, token, state)
+
+    def list_item(self, token: Dict[str, Any], state: BlockState) -> str:
+        return render_list_item(self, token, state)
+
+    def task_list_item(self, token: Dict[str, Any], state: BlockState) -> str:
+        checked = token.get("attrs", {}).get("checked")
+        marker = "[x] " if checked else "[ ] "
+        return render_list_item(self, token, state, marker)
+
+    def table(self, token: Dict[str, Any], state: BlockState) -> str:
+        children = token.get("children", [])
+        if not children:
+            return "\n"
+
+        head = children[0]
+        body = children[1] if len(children) > 1 else None
+        head_cells = head.get("children", [])
+        align = [_table_cell_align(cell) for cell in head_cells]
+        lines = [
+            _render_table_row(self, head_cells, state),
+            _render_table_delimiter(align),
+        ]
+        if body:
+            for row in body.get("children", []):
+                lines.append(_render_table_row(self, row.get("children", []), state))
+        return "\n".join(lines) + "\n\n"
+
+    def table_head(self, token: Dict[str, Any], state: BlockState) -> str:
+        cells = token.get("children", [])
+        return (
+            _render_table_row(self, cells, state)
+            + "\n"
+            + _render_table_delimiter([_table_cell_align(c) for c in cells])
+        )
+
+    def table_body(self, token: Dict[str, Any], state: BlockState) -> str:
+        return "\n".join(self.render_token(row, state).rstrip("\n") for row in token.get("children", []))
+
+    def table_row(self, token: Dict[str, Any], state: BlockState) -> str:
+        return _render_table_row(self, token.get("children", []), state) + "\n"
+
+    def table_cell(self, token: Dict[str, Any], state: BlockState) -> str:
+        return _render_table_cell(self, token, state)
+
+
+def _escape_title(title: str) -> str:
+    """Escape a link/image title for emission inside double quotes. The closing
+    quote would otherwise end the title early on a re-parse; a backslash is
+    escaped first so it can't combine with the following character."""
+    return title.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _escape_block_prefix(text: str) -> str:
+    """Backslash-escape a leading block marker on each line so that literal
+    text is not re-parsed as a list, heading or block quote."""
+    return "\n".join(_escape_line_prefix(line) for line in text.split("\n"))
+
+
+def _escape_line_prefix(line: str) -> str:
+    m = _block_prefix_re.match(line)
+    if not m:
+        return line
+    indent_, marker = m.group(1), m.group(2)
+    return indent_ + marker[:-1] + "\\" + marker[-1] + line[m.end(2) :]
 
 
 def _get_fenced_marker(code: str) -> str:
@@ -148,3 +276,35 @@ def _get_fenced_marker(code: str) -> str:
     if not waves:
         return "~~~"
     return "`" * (max(ticks) + 1)
+
+
+def _render_table_row(renderer: MarkdownRenderer, cells: Iterable[Dict[str, Any]], state: BlockState) -> str:
+    return "| " + " | ".join(_render_table_cell(renderer, cell, state) for cell in cells) + " |"
+
+
+def _render_table_delimiter(aligns: Iterable[Any]) -> str:
+    cells = []
+    for align in aligns:
+        if align == "left":
+            cells.append(":---")
+        elif align == "center":
+            cells.append(":---:")
+        elif align == "right":
+            cells.append("---:")
+        else:
+            cells.append("---")
+    return "| " + " | ".join(cells) + " |"
+
+
+def _render_table_cell(renderer: MarkdownRenderer, token: Dict[str, Any], state: BlockState) -> str:
+    if "children" in token:
+        text = renderer.render_children(token, state)
+    else:
+        text = cast(str, token.get("raw", ""))
+    # Code spans can already contain escaped pipes; keep an odd escape count.
+    text = re.sub(r"\\.|[|]", lambda m: r"\|" if m[0] == "|" else m[0], text)
+    return text.replace("\n", " ").strip()
+
+
+def _table_cell_align(token: Dict[str, Any]) -> Any:
+    return token.get("attrs", {}).get("align")

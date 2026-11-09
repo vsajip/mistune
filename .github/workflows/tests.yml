@@ -3,50 +3,104 @@ name: Run tests
 on:
   push:
     branches-ignore:
-    - 'wip-*'
-    paths-ignore:
-    - 'docs/**'
+      - 'wip-*'
   pull_request:
     branches-ignore:
-    - 'wip-*'
-    paths-ignore:
-    - 'docs/**'
+      - 'wip-*'
+  workflow_dispatch:
+
 
 jobs:
-  build:
+  lint:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      max-parallel: 6
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "pypy3.11"]
+    permissions:
+      contents: read
 
     steps:
-    - uses: actions/checkout@v6
-    - name: Set up Python ${{ matrix.python }} on ${{ matrix.os }}
-      uses: actions/setup-python@v6
-      with:
-        python-version: ${{ matrix.python }}
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: "3.13"
 
-    - name: Install dependencies
-      run: pip install -r requirements-dev.lock
+      - name: ruff lint
+        run: uv run --locked --group lint ruff check .
 
-    - name: Check types with Python ${{ matrix.python }} on ${{ matrix.os }}
-      run: |
-        mypy --strict src
-        mypy src tests
+      - name: mypy lint
+        run: uv run --locked --group lint mypy
 
-    - name: Test with Python ${{ matrix.python }} on ${{ matrix.os }}
-      run: pytest
+  docs:
+    needs: lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
-    - name: Report coverage
-      run: pytest --cov=mistune --cov-report=xml
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: "3.13"
 
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v5
-      with:
-        token: ${{ secrets.CODECOV_TOKEN }}
-        files: ./coverage.xml
-        flags: unittests
-        name: GitHub
+      - name: Build documentation without remote inventories
+        env:
+          MISTUNE_DOCS_OFFLINE: "1"
+        run: uv run --locked --group docs sphinx-build -W -b dummy docs /tmp/mistune-docs
+
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+          - "3.15"
+          - "pypy3.11"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up uv and Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Report coverage
+        run: uv run --locked --group test pytest --cov=mistune --cov-branch --cov-report=xml
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  sonar:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: "3.13"
+
+      - name: Generate coverage
+        run: uv run --locked --group test pytest --cov=mistune --cov-branch --cov-report=xml
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v8
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

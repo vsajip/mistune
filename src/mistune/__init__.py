@@ -3,12 +3,14 @@ mistune
 ~~~~~~~
 
 A fast yet powerful Python Markdown parser with renderers and
-plugins, compatible with sane CommonMark rules.
+plugins, compatible with CommonMark 0.31.2.
 
 Documentation: https://mistune.lepture.com/
 """
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, Literal
+from functools import lru_cache
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
+
 from .block_parser import BlockParser
 from .core import BaseRenderer, BlockState, InlineState
 from .inline_parser import InlineParser
@@ -21,14 +23,15 @@ RendererRef = Union[Literal["html", "ast"], BaseRenderer]
 
 
 def create_markdown(
-    escape: bool = True,
+    escape: Optional[bool] = None,
     hard_wrap: bool = False,
     renderer: Optional[RendererRef] = "html",
     plugins: Optional[Iterable[PluginRef]] = None,
 ) -> Markdown:
     """Create a Markdown instance based on the given condition.
 
-    :param escape: Boolean. If using html renderer, escape html.
+    :param escape: Boolean. If using html renderer, escape html. When it is
+        ``None``, the renderer keeps its own escape setting.
     :param hard_wrap: Boolean. Break every new line into ``<br>``.
     :param renderer: renderer instance, default is HTMLRenderer.
     :param plugins: List of plugins.
@@ -46,19 +49,27 @@ def create_markdown(
         # explicit and more similar to 2.x's API
         renderer = None
     elif renderer == "html":
-        renderer = HTMLRenderer(escape=escape)
+        renderer = HTMLRenderer(escape=True if escape is None else escape)
+    elif escape is not None and isinstance(renderer, HTMLRenderer):
+        # a renderer instance was given, honor the explicit escape flag
+        renderer.escape_enabled = escape
 
     inline = InlineParser(hard_wrap=hard_wrap)
     real_plugins: Optional[Iterable[Plugin]] = None
     if plugins is not None:
-        real_plugins = [import_plugin(n) for n in plugins]
+        real_plugins = [import_plugin(n) for n in plugins if n != "speedup"]
     return Markdown(renderer=renderer, inline=inline, plugins=real_plugins)
 
 
-html: Markdown = create_markdown(escape=False, plugins=["strikethrough", "footnotes", "table", "speedup"])
+html: Markdown = create_markdown(escape=False, plugins=["strikethrough", "footnotes", "table"])
 
 
-__cached_parsers: Dict[Tuple[bool, Optional[RendererRef], Optional[Iterable[Any]]], Markdown] = {}
+_BuiltinRendererRef = Optional[Literal["html", "ast"]]
+
+
+@lru_cache(maxsize=128)
+def _cached_markdown(escape: bool, renderer: _BuiltinRendererRef, plugins: Tuple[str, ...]) -> Markdown:
+    return create_markdown(escape=escape, renderer=renderer, plugins=plugins)
 
 
 def markdown(
@@ -67,16 +78,13 @@ def markdown(
     renderer: Optional[RendererRef] = "html",
     plugins: Optional[Iterable[Any]] = None,
 ) -> Union[str, List[Dict[str, Any]]]:
-    if renderer == "ast":
-        # explicit and more similar to 2.x's API
-        renderer = None
-    key = (escape, renderer, plugins)
-    if key in __cached_parsers:
-        return __cached_parsers[key](text)
-
-    md = create_markdown(escape=escape, renderer=renderer, plugins=plugins)
-    # improve the speed for markdown parser creation
-    __cached_parsers[key] = md
+    plugin_refs = tuple(plugins) if plugins is not None else ()
+    if (renderer is None or (isinstance(renderer, str) and renderer in ("html", "ast"))) and all(
+        isinstance(plugin, str) for plugin in plugin_refs
+    ):
+        md = _cached_markdown(escape, renderer, plugin_refs)
+    else:
+        md = create_markdown(escape=escape, renderer=renderer, plugins=plugin_refs)
     return md(text)
 
 
@@ -97,5 +105,5 @@ __all__ = [
     "markdown",
 ]
 
-__version__ = "3.2.0"
+__version__ = "3.4.0"
 __homepage__ = "https://mistune.lepture.com/"

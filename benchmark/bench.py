@@ -40,16 +40,10 @@ def get_markdown_parsers():
     parsers = {}
 
     import mistune
-    from mistune.directives import (
-        RSTDirective,
-        Admonition,
-        TableOfContents,
-        Include,
-    )
+    from mistune.directives import Admonition, Include, RSTDirective, TableOfContents
 
     parsers[f"mistune ({mistune.__version__})"] = mistune.html
-    parsers["mistune (slow)"] = mistune.create_markdown(escape=False)
-    parsers["mistune (fast)"] = mistune.create_markdown(escape=False, plugins=["speedup"])
+    parsers["mistune (core)"] = mistune.create_markdown(escape=False)
     parsers["mistune (full)"] = mistune.create_markdown(
         escape=False,
         plugins=[
@@ -73,7 +67,6 @@ def get_markdown_parsers():
                     Include(),
                 ]
             ),
-            "speedup",
         ],
     )
 
@@ -92,7 +85,8 @@ def get_markdown_parsers():
         pass
 
     try:
-        from markdown2 import Markdown, __version__ as m2v
+        from markdown2 import Markdown
+        from markdown2 import __version__ as m2v
 
         markdowner = Markdown()
         parsers[f"markdown2 ({m2v})"] = markdowner.convert
@@ -107,7 +101,8 @@ def get_markdown_parsers():
         pass
 
     try:
-        from markdown_it import MarkdownIt, __version__ as mitv
+        from markdown_it import MarkdownIt
+        from markdown_it import __version__ as mitv
 
         md = MarkdownIt()
         parsers[f"markdown_it ({mitv})"] = md.render
